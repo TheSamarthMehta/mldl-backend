@@ -43,10 +43,6 @@ data/raw/*
 data/processed/*
 !data/.gitkeep
 
-# Models
-models/trained/*
-!models/.gitkeep
-
 # OS
 .DS_Store
 Thumbs.db
