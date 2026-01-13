@@ -1,160 +1,413 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+"""
+Standalone Cardiovascular Disease Prediction API
+All functionality in one file - no external dependencies
+"""
+
 import os
 import sys
-from datetime import datetime
 import logging
+import joblib
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 
-# Add parent directory to path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
 
-from utils.logger import setup_logger
-from utils.validators import validate_prediction_input
-from models.model_manager import ModelManager
-from scripts.train import train_model
+def setup_logger():
+    """Setup application logger"""
+    log_dir = 'logs'
+    os.makedirs(log_dir, exist_ok=True)
+    
+    logger = logging.getLogger('cardio_app')
+    logger.setLevel(logging.INFO)
+    logger.handlers = []
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+    console_handler.setFormatter(console_formatter)
+    
+    # File handler
+    log_file = os.path.join(log_dir, f'app_{datetime.now().strftime("%Y%m%d")}.log')
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+    
+    return logger
 
-# Initialize Flask app
-app = Flask(__name__)
-CORS(app)
-
-# Setup logging
 logger = setup_logger()
 
-# Initialize model manager
-model_manager = ModelManager()
+# ============================================================================
+# MODEL MANAGER CLASS
+# ============================================================================
 
-# Check if model is loaded
-if model_manager.is_model_loaded():
-    logger.info("=" * 70)
-    logger.info("MODEL IS READY FOR PREDICTIONS!")
-    logger.info("=" * 70)
-    model_info = model_manager.get_model_info()
-    logger.info(f"Model Type: {model_info.get('type', 'Unknown')}")
-    logger.info(f"Features: {len(model_info.get('feature_names', []))} features")
-    logger.info(f"Loaded at: {model_info.get('loaded_at', 'Unknown')}")
-    logger.info("=" * 70)
-else:
-    logger.warning("WARNING: No model loaded! Please train a model first: python scripts/train.py")
+class ModelManager:
+    """Manages ML model loading, training, and predictions"""
+    
+    def __init__(self):
+        self.model = None
+        self.scaler = None
+        self.feature_names = None
+        self.model_type = None
+        self.model_path = None
+        self.model_info = {}
+        self.load_default_model()
+    
+    def load_default_model(self):
+        """Load the default or latest trained model"""
+        try:
+            trained_dir = os.path.join('models', 'trained')
+            if os.path.exists(trained_dir):
+                pkl_files = [f for f in os.listdir(trained_dir) if f.endswith('.pkl')]
+                if pkl_files:
+                    latest_model = max(pkl_files, key=lambda f: os.path.getmtime(os.path.join(trained_dir, f)))
+                    model_path = os.path.join(trained_dir, latest_model)
+                    self.load_model(model_path)
+                    logger.info(f"Loaded model: {latest_model}")
+                else:
+                    logger.warning("No trained models found - will need to train first")
+            else:
+                logger.warning("Models directory not found - will need to train first")
+        except Exception as e:
+            logger.error(f"Error loading default model: {str(e)}")
+    
+    def load_model(self, model_path):
+        """Load a trained model from disk"""
+        try:
+            model_data = joblib.load(model_path)
+            
+            if isinstance(model_data, dict):
+                self.model = model_data.get('model')
+                self.scaler = model_data.get('scaler')
+                self.feature_names = model_data.get('feature_names')
+                self.model_type = model_data.get('model_type')
+            else:
+                self.model = model_data
+                self.scaler = None
+                self.feature_names = None
+                self.model_type = None
+            
+            self.model_path = model_path
+            self.model_info = {
+                'path': model_path,
+                'loaded_at': datetime.now().isoformat(),
+                'type': type(self.model).__name__,
+                'has_scaler': self.scaler is not None,
+                'feature_names': self.feature_names
+            }
+            
+            logger.info(f"Model loaded: {type(self.model).__name__}")
+            if self.feature_names:
+                logger.info(f"Features: {len(self.feature_names)} features")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error loading model: {str(e)}")
+            raise
+    
+    def is_model_loaded(self):
+        """Check if model is loaded and ready"""
+        return self.model is not None
+    
+    def get_model_info(self):
+        """Get information about current model"""
+        return {
+            'loaded': self.is_model_loaded(),
+            'type': type(self.model).__name__ if self.model else None,
+            'features': len(self.feature_names) if self.feature_names else None,
+            'has_scaler': self.scaler is not None,
+            'loaded_at': self.model_info.get('loaded_at')
+        }
+    
+    def predict(self, input_data):
+        """Make predictions using the loaded model"""
+        if self.model is None:
+            raise ValueError("No model loaded. Please train a model first.")
+        
+        try:
+            # Convert input to DataFrame
+            if isinstance(input_data, dict):
+                df = pd.DataFrame([input_data])
+            else:
+                df = pd.DataFrame(input_data)
+            
+            # Feature engineering
+            if 'age' in df.columns and 'age_years' not in df.columns:
+                df['age_years'] = df['age'] / 365.25
+                df = df.drop('age', axis=1)
+            
+            if 'bmi' not in df.columns and 'height' in df.columns and 'weight' in df.columns:
+                df['bmi'] = df['weight'] / ((df['height'] / 100) ** 2)
+            
+            if 'pulse_pressure' not in df.columns and 'ap_hi' in df.columns and 'ap_lo' in df.columns:
+                df['pulse_pressure'] = df['ap_hi'] - df['ap_lo']
+            
+            # Ensure features are in correct order
+            if self.feature_names:
+                missing_features = set(self.feature_names) - set(df.columns)
+                if missing_features:
+                    raise ValueError(f"Missing features: {missing_features}")
+                df = df[self.feature_names]
+            
+            # Apply scaling if available
+            if self.scaler is not None:
+                df_scaled = self.scaler.transform(df)
+                df = pd.DataFrame(df_scaled, columns=df.columns)
+            
+            # Make prediction
+            prediction = self.model.predict(df)
+            
+            result = {
+                'prediction': int(prediction[0]),
+                'risk_level': 'High Risk' if prediction[0] == 1 else 'Low Risk'
+            }
+            
+            # Get probability if available
+            if hasattr(self.model, 'predict_proba'):
+                probabilities = self.model.predict_proba(df)
+                result['probability'] = float(probabilities[0][1])
+                result['confidence'] = float(max(probabilities[0]))
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Prediction error: {str(e)}")
+            raise
+    
+    def train_model(self, model_type='logistic_regression', data_path=None):
+        """Train a new model"""
+        try:
+            logger.info(f"Starting training for {model_type} model")
+            
+            # Load data
+            if data_path is None:
+                data_path = os.path.join('data', 'cardio_train.csv')
+            
+            if not os.path.exists(data_path):
+                raise FileNotFoundError(f"Data file not found: {data_path}")
+            
+            # Read CSV
+            df = pd.read_csv(data_path, sep=';')
+            logger.info(f"Data loaded: {len(df)} samples")
+            
+            # Drop id column
+            if 'id' in df.columns:
+                df = df.drop('id', axis=1)
+            
+            # Feature engineering
+            if 'age' in df.columns:
+                df['age_years'] = df['age'] / 365.25
+                df = df.drop('age', axis=1)
+            
+            if 'height' in df.columns and 'weight' in df.columns:
+                df['bmi'] = df['weight'] / ((df['height'] / 100) ** 2)
+            
+            if 'ap_hi' in df.columns and 'ap_lo' in df.columns:
+                df['pulse_pressure'] = df['ap_hi'] - df['ap_lo']
+            
+            # Remove outliers
+            df = df[(df['ap_hi'] >= 80) & (df['ap_hi'] <= 220)]
+            df = df[(df['ap_lo'] >= 50) & (df['ap_lo'] <= 140)]
+            df = df[(df['height'] >= 140) & (df['height'] <= 210)]
+            df = df[(df['weight'] >= 30) & (df['weight'] <= 200)]
+            
+            logger.info(f"After preprocessing: {len(df)} samples")
+            
+            # Split features and target
+            X = df.drop('cardio', axis=1)
+            y = df['cardio']
+            
+            # Split data
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            
+            # Scale features
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_test_scaled = scaler.transform(X_test)
+            
+            X_train = pd.DataFrame(X_train_scaled, columns=X_train.columns)
+            X_test = pd.DataFrame(X_test_scaled, columns=X_test.columns)
+            
+            # Get model
+            models = {
+                'logistic_regression': LogisticRegression(max_iter=1000, random_state=42),
+                'random_forest': RandomForestClassifier(n_estimators=100, random_state=42),
+                'gradient_boosting': GradientBoostingClassifier(n_estimators=100, random_state=42),
+                'decision_tree': DecisionTreeClassifier(random_state=42),
+                'svm': SVC(kernel='rbf', probability=True, random_state=42)
+            }
+            
+            model = models.get(model_type, models['logistic_regression'])
+            logger.info(f"Training {model.__class__.__name__}...")
+            
+            # Train
+            model.fit(X_train, y_train)
+            
+            # Evaluate
+            test_predictions = model.predict(X_test)
+            test_accuracy = accuracy_score(y_test, test_predictions)
+            precision = precision_score(y_test, test_predictions)
+            recall = recall_score(y_test, test_predictions)
+            f1 = f1_score(y_test, test_predictions)
+            
+            logger.info(f"Accuracy: {test_accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
+            
+            # Save model
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            model_filename = f"cardio_model_{model_type}_{timestamp}.pkl"
+            model_path = os.path.join('models', 'trained', model_filename)
+            
+            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+            
+            model_data = {
+                'model': model,
+                'scaler': scaler,
+                'feature_names': list(X_train.columns),
+                'model_type': model_type
+            }
+            
+            joblib.dump(model_data, model_path)
+            logger.info(f"Model saved: {model_path}")
+            
+            # Load the new model
+            self.load_model(model_path)
+            
+            return {
+                'success': True,
+                'model_path': model_path,
+                'metrics': {
+                    'test_accuracy': float(test_accuracy),
+                    'precision': float(precision),
+                    'recall': float(recall),
+                    'f1_score': float(f1)
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Training failed: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
 
-# Configuration
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
-app.config['JSON_SORT_KEYS'] = False
+# ============================================================================
+# RECOMMENDATION GENERATOR
+# ============================================================================
 
-
-def generate_recommendations(risk_level, probability, patient_data):
-    """Generate personalized recommendations based on percentage risk ranges"""
+def generate_recommendations(risk_level, risk_probability, patient_data):
+    """Generate personalized recommendations based on risk factors"""
     recommendations = []
+    risk_percentage = risk_probability * 100
     risk_factors = []
-    risk_percentage = probability * 100
     
-    # Determine risk category based on percentage ranges (same as gauge colors)
-    if risk_percentage < 33:
-        risk_category = 'low'
-        urgency_level = 'low'
-    elif risk_percentage < 66:
-        risk_category = 'medium'
-        urgency_level = 'medium'
-    else:
-        risk_category = 'high'
-        urgency_level = 'critical' if risk_percentage >= 80 else 'high'
-    
-    # PRIMARY RECOMMENDATION based on precise risk percentage
+    # Critical risk (>90%)
     if risk_percentage >= 90:
+        priority = 'critical'
         recommendations.append({
-            'priority': 'critical',
-            'category': 'Urgent Medical Care',
-            'title': '🚨 Emergency Cardiovascular Evaluation Required',
-            'description': f'Your risk is {risk_percentage:.1f}% - CRITICAL LEVEL. Visit emergency care or call your doctor TODAY. You need immediate ECG, cardiac enzyme tests, stress test, and comprehensive cardiovascular assessment within 24-48 hours.'
+            'priority': priority,
+            'category': 'Immediate Action Required',
+            'title': '🚨 URGENT: Critical CVD Risk Detected',
+            'description': f'Your risk score of {risk_percentage:.1f}% indicates CRITICAL cardiovascular disease risk. This requires IMMEDIATE medical attention. Visit the emergency room or call emergency services if experiencing chest pain, shortness of breath, or extreme fatigue. Schedule urgent cardiology consultation within 24-48 hours.'
         })
+    
+    # Very high risk (80-90%)
     elif risk_percentage >= 80:
+        priority = 'critical'
         recommendations.append({
-            'priority': 'critical',
-            'category': 'Urgent Medical Care',
-            'title': 'Immediate Medical Attention Needed',
-            'description': f'At {risk_percentage:.1f}% risk, seek medical care within 2-3 days. Schedule appointments for ECG, lipid panel, HbA1c test, and comprehensive cardiovascular screening. Consider emergency room if experiencing chest pain or shortness of breath.'
+            'priority': priority,
+            'category': 'Urgent Medical Attention',
+            'title': '⚠️ Very High CVD Risk - Immediate Action Needed',
+            'description': f'Your {risk_percentage:.1f}% risk level requires immediate medical intervention. Schedule an urgent appointment with a cardiologist within 1 week. Medication, lifestyle changes, and close monitoring are essential to prevent cardiovascular events.'
         })
-    elif risk_percentage >= 70:
+    
+    # High risk (66-80%)
+    elif risk_percentage >= 66:
+        priority = 'critical'
         recommendations.append({
-            'priority': 'high',
-            'category': 'Medical Consultation',
-            'title': 'Urgent Doctor Appointment Required',
-            'description': f'Your {risk_percentage:.1f}% risk requires medical intervention within 1 week. Schedule comprehensive cardiac evaluation including stress test, cholesterol screening, and blood pressure monitoring. Discuss preventive medications with your doctor.'
+            'priority': priority,
+            'category': 'High Risk Alert',
+            'title': '🔴 High CVD Risk Requires Action',
+            'description': f'At {risk_percentage:.1f}% risk, you have a significantly elevated chance of cardiovascular disease. See a doctor within 2 weeks for comprehensive cardiac evaluation. Aggressive lifestyle modifications and likely medication are needed.'
         })
-    elif risk_percentage >= 60:
-        recommendations.append({
-            'priority': 'high',
-            'category': 'Medical Consultation',
-            'title': 'Schedule Medical Evaluation Soon',
-            'description': f'At {risk_percentage:.1f}% risk, see your doctor within 2 weeks. Get full cardiovascular risk assessment, blood work (lipid panel, glucose), and blood pressure monitoring. Discuss lifestyle modifications and potential medication.'
-        })
+    
+    # Elevated risk (50-66%)
     elif risk_percentage >= 50:
+        priority = 'high'
         recommendations.append({
-            'priority': 'high',
-            'category': 'Medical Check-up',
-            'title': 'Medical Check-up Recommended',
-            'description': f'Your {risk_percentage:.1f}% risk is above average. Schedule a doctor visit within 1 month for cardiovascular screening, blood pressure check, cholesterol testing, and personalized prevention plan.'
+            'priority': priority,
+            'category': 'Elevated Risk',
+            'title': '🟠 Elevated CVD Risk - Take Action',
+            'description': f'Your {risk_percentage:.1f}% risk indicates elevated cardiovascular disease risk. Schedule a doctor\'s appointment within 1 month for full evaluation. Start implementing lifestyle changes immediately: diet, exercise, stress management.'
         })
+    
+    # Moderate-high risk (40-50%)
     elif risk_percentage >= 40:
+        priority = 'high'
         recommendations.append({
-            'priority': 'medium',
-            'category': 'Preventive Care',
-            'title': 'Preventive Medical Consultation',
-            'description': f'At {risk_percentage:.1f}% risk, schedule routine check-up within 2 months. Focus on lifestyle modifications, regular BP monitoring, and annual cardiovascular screening to prevent risk escalation.'
+            'priority': priority,
+            'category': 'Moderate-High Risk',
+            'title': '🟡 Moderate-High Risk Level',
+            'description': f'At {risk_percentage:.1f}% risk, you should take preventive action. Schedule a check-up within 2-3 months. Focus on healthy lifestyle: regular exercise (150 min/week), balanced diet, maintain healthy weight, manage stress.'
         })
-    elif risk_percentage >= 33:
+    
+    # Moderate risk (30-40%)
+    elif risk_percentage >= 30:
+        priority = 'medium'
         recommendations.append({
-            'priority': 'medium',
-            'category': 'Preventive Care',
-            'title': 'Routine Monitoring Advised',
-            'description': f'Your {risk_percentage:.1f}% risk is borderline. Maintain regular check-ups every 6 months, adopt heart-healthy habits, and monitor blood pressure monthly to keep risk from increasing.'
+            'priority': priority,
+            'category': 'Moderate Risk',
+            'title': 'Moderate Risk - Prevention Focus',
+            'description': f'Your {risk_percentage:.1f}% risk suggests room for improvement. Focus on prevention: eat more vegetables and fruits, exercise regularly, maintain healthy weight, avoid smoking, limit alcohol. Annual check-ups recommended.'
         })
+    
+    # Low-moderate risk (20-30%)
     elif risk_percentage >= 20:
+        priority = 'medium'
         recommendations.append({
-            'priority': 'low',
-            'category': 'Prevention',
-            'title': 'Maintain Heart-Healthy Lifestyle',
-            'description': f'Your {risk_percentage:.1f}% risk is low. Continue your healthy habits with annual check-ups, regular exercise (150 min/week), balanced diet, and stress management to keep your heart healthy.'
+            'priority': priority,
+            'category': 'Low-Moderate Risk',
+            'title': 'Low-Moderate Risk - Stay Healthy',
+            'description': f'At {risk_percentage:.1f}% risk, you\'re in a relatively good position. Maintain healthy habits: balanced diet, regular physical activity (30 min/day), stress management, adequate sleep. Regular health screenings recommended.'
         })
+    
+    # Low risk (<20%)
     else:
-        recommendations.append({
-            'priority': 'low',
-            'category': 'Prevention',
-            'title': 'Excellent Heart Health Status',
-            'description': f'Your {risk_percentage:.1f}% risk is very low. Keep up your excellent lifestyle choices! Continue with annual wellness exams, stay physically active, and maintain your healthy diet and habits.'
-        })
-    
-    # LIFESTYLE RISK FACTORS - with percentage-adjusted urgency
-    if patient_data.get('smoke', 0) == 1:
-        risk_factors.append('smoking')
-        priority = 'critical' if risk_percentage >= 66 else 'high'
+        priority = 'low'
         recommendations.append({
             'priority': priority,
-            'category': 'Critical Lifestyle Change',
-            'title': '🚭 Quit Smoking IMMEDIATELY',
-            'description': f'Smoking with {risk_percentage:.1f}% CVD risk is life-threatening. Quitting can reduce your risk by 50% within 1 year. Contact smoking cessation programs, use nicotine replacement therapy (patches, gum), or ask doctor about prescription medications like Chantix or Zyban.'
+            'category': 'Low Risk',
+            'title': '✅ Low CVD Risk - Maintain Health',
+            'description': f'Excellent! Your {risk_percentage:.1f}% risk indicates low cardiovascular disease risk. Continue your healthy lifestyle: stay active, eat nutritious foods, maintain healthy weight, avoid smoking, limit alcohol. Keep up the good work!'
         })
     
-    if patient_data.get('alco', 0) == 1:
-        risk_factors.append('alcohol consumption')
-        priority = 'high' if risk_percentage >= 66 else 'medium'
-        recommendations.append({
-            'priority': priority,
-            'category': 'Lifestyle Modification',
-            'title': '🍷 Reduce Alcohol Consumption',
-            'description': f'At {risk_percentage:.1f}% risk, limit alcohol to maximum 1 drink/day (women) or 2 drinks/day (men). Consider complete abstinence if risk is high. Excessive alcohol raises blood pressure and triglycerides significantly.'
-        })
-    
-    if patient_data.get('active', 1) == 0:
-        risk_factors.append('physical inactivity')
-        priority = 'high' if risk_percentage >= 50 else 'medium'
+    # Physical activity recommendations
+    if patient_data.get('active', 0) == 0:
+        risk_factors.append('sedentary lifestyle')
+        priority = 'critical' if risk_percentage >= 66 else 'high' if risk_percentage >= 40 else 'medium'
         recommendations.append({
             'priority': priority,
             'category': 'Exercise Program',
             'title': '💪 Start Physical Activity Immediately',
-            'description': f'Sedentary lifestyle with {risk_percentage:.1f}% risk requires urgent action. Start with 10-minute walks 3x daily, gradually increasing to 30 minutes of moderate activity 5 days/week. Join cardiac rehab program if available. Exercise can reduce CVD risk by 30-40%.'
+            'description': f'Sedentary lifestyle with {risk_percentage:.1f}% risk requires urgent action. Start with 10-minute walks 3x daily, gradually increasing to 30 minutes of moderate activity 5 days/week. Exercise can reduce CVD risk by 30-40%.'
         })
     
-    # BMI-BASED RECOMMENDATIONS with percentage context
+    # BMI-based recommendations
     height_m = patient_data.get('height', 170) / 100
     weight = patient_data.get('weight', 70)
     bmi = weight / (height_m ** 2)
@@ -166,25 +419,18 @@ def generate_recommendations(risk_level, probability, patient_data):
             'priority': priority,
             'category': 'Weight Management',
             'title': '⚖️ Urgent Weight Loss Required',
-            'description': f'BMI {bmi:.1f} (obese) + {risk_percentage:.1f}% CVD risk is dangerous. Target: lose 10% body weight ({weight*0.1:.1f}kg) in 6 months. Work with dietitian for 500-750 calorie/day deficit. Even 5-10% weight loss reduces risk significantly. Consider medical weight loss programs.'
+            'description': f'BMI {bmi:.1f} (obese) + {risk_percentage:.1f}% CVD risk is dangerous. Target: lose 10% body weight ({weight*0.1:.1f}kg) in 6 months. Work with dietitian for 500-750 calorie/day deficit. Even 5-10% weight loss reduces risk significantly.'
         })
-    elif bmi > 27:
-        priority = 'high' if risk_percentage >= 50 else 'medium'
+    elif bmi > 25:
+        priority = 'medium'
         recommendations.append({
             'priority': priority,
             'category': 'Weight Management',
             'title': 'Weight Reduction Recommended',
-            'description': f'BMI {bmi:.1f} (overweight) contributes to your {risk_percentage:.1f}% risk. Target BMI: 25 or below. Aim for 0.5-1kg weight loss per week through balanced diet (focus on vegetables, lean protein, whole grains) and regular exercise.'
-        })
-    elif bmi > 25:
-        recommendations.append({
-            'priority': 'medium',
-            'category': 'Weight Management',
-            'title': 'Weight Monitoring Advised',
-            'description': f'BMI {bmi:.1f} is slightly elevated. Maintain current weight or aim for modest reduction to BMI 22-24. Focus on portion control and regular physical activity to prevent weight gain.'
+            'description': f'BMI {bmi:.1f} (overweight) contributes to your {risk_percentage:.1f}% risk. Target BMI: 25 or below. Aim for 0.5-1kg weight loss per week through balanced diet and regular exercise.'
         })
     
-    # BLOOD PRESSURE with percentage-based urgency
+    # Blood pressure recommendations
     ap_hi = patient_data.get('ap_hi', 120)
     ap_lo = patient_data.get('ap_lo', 80)
     
@@ -194,7 +440,7 @@ def generate_recommendations(risk_level, probability, patient_data):
             'priority': 'critical',
             'category': 'Blood Pressure Emergency',
             'title': '🔴 Critical Hypertension - Immediate Action',
-            'description': f'BP {ap_hi}/{ap_lo} + {risk_percentage:.1f}% risk = HYPERTENSIVE CRISIS. See doctor TODAY or visit ER if >180/120. Start medication immediately. Monitor BP twice daily. Reduce sodium to <1500mg/day. This requires urgent medical intervention to prevent heart attack or stroke.'
+            'description': f'BP {ap_hi}/{ap_lo} + {risk_percentage:.1f}% risk = HYPERTENSIVE CRISIS. See doctor TODAY or visit ER if >180/120. Start medication immediately. Monitor BP twice daily. Reduce sodium to <1500mg/day.'
         })
     elif ap_hi >= 140 or ap_lo >= 90:
         risk_factors.append('hypertension stage 1')
@@ -203,7 +449,7 @@ def generate_recommendations(risk_level, probability, patient_data):
             'priority': priority,
             'category': 'Blood Pressure Management',
             'title': 'Hypertension Treatment Needed',
-            'description': f'BP {ap_hi}/{ap_lo} requires medication at {risk_percentage:.1f}% risk. See doctor within 1 week. Start DASH diet (reduce sodium <2300mg/day, increase potassium). Monitor BP daily. Likely need antihypertensive medication (ACE inhibitor, ARB, or CCB).'
+            'description': f'BP {ap_hi}/{ap_lo} requires medication at {risk_percentage:.1f}% risk. See doctor within 1 week. Start DASH diet (reduce sodium <2300mg/day, increase potassium). Monitor BP daily.'
         })
     elif ap_hi >= 130 or ap_lo >= 85:
         priority = 'high' if risk_percentage >= 50 else 'medium'
@@ -211,226 +457,125 @@ def generate_recommendations(risk_level, probability, patient_data):
             'priority': priority,
             'category': 'Blood Pressure',
             'title': 'Elevated Blood Pressure Management',
-            'description': f'BP {ap_hi}/{ap_lo} is elevated. At {risk_percentage:.1f}% risk, aggressive lifestyle changes needed: reduce sodium to <2000mg/day, lose weight if overweight, exercise 30 min/day, limit alcohol, manage stress. Monitor BP weekly. May need medication if not improving in 3-6 months.'
-        })
-    elif ap_hi >= 120:
-        recommendations.append({
-            'priority': 'medium',
-            'category': 'Blood Pressure',
-            'title': 'Blood Pressure Monitoring',
-            'description': f'BP {ap_hi}/{ap_lo} is prehypertensive. Monitor monthly and maintain healthy lifestyle to prevent progression. Focus on weight management, regular exercise, and low-sodium diet (<2300mg/day).'
+            'description': f'BP {ap_hi}/{ap_lo} is elevated. At {risk_percentage:.1f}% risk, lifestyle changes needed: reduce sodium to <2000mg/day, lose weight if overweight, exercise 30 min/day, limit alcohol, manage stress.'
         })
     
-    # CHOLESTEROL with context
-    if patient_data.get('cholesterol', 1) == 3:
-        risk_factors.append('very high cholesterol')
+    # Cholesterol recommendations
+    if patient_data.get('cholesterol', 1) >= 2:
+        risk_factors.append('high cholesterol')
         priority = 'critical' if risk_percentage >= 66 else 'high'
         recommendations.append({
             'priority': priority,
             'category': 'Cholesterol Management',
-            'title': 'Severe Hypercholesterolemia Treatment',
-            'description': f'Very high cholesterol + {risk_percentage:.1f}% risk requires immediate statin therapy. See doctor within 3 days. Get lipid panel (LDL, HDL, triglycerides). Target LDL <70mg/dL. Adopt Mediterranean diet, eliminate trans fats, increase fiber (oats, beans), take omega-3 supplements.'
+            'title': 'High Cholesterol Requires Treatment',
+            'description': f'Elevated cholesterol with {risk_percentage:.1f}% risk requires intervention. See doctor for lipid panel. Reduce saturated fat, increase fiber, consider statin medication. Target LDL <100 mg/dL.'
         })
-    elif patient_data.get('cholesterol', 1) == 2:
-        risk_factors.append('elevated cholesterol')
+    
+    # Smoking recommendations
+    if patient_data.get('smoke', 0) == 1:
+        risk_factors.append('smoking')
+        recommendations.append({
+            'priority': 'critical',
+            'category': 'Smoking Cessation',
+            'title': '🚭 QUIT SMOKING IMMEDIATELY',
+            'description': f'Smoking + {risk_percentage:.1f}% CVD risk is life-threatening. Quitting is THE MOST IMPORTANT action. Talk to doctor about nicotine replacement, medications (Chantix, Wellbutrin), counseling. Quitting reduces heart disease risk by 50% within 1 year.'
+        })
+    
+    # Alcohol recommendations
+    if patient_data.get('alco', 0) == 1:
         priority = 'high' if risk_percentage >= 50 else 'medium'
         recommendations.append({
             'priority': priority,
-            'category': 'Cholesterol',
-            'title': 'Cholesterol Reduction Program',
-            'description': f'Elevated cholesterol at {risk_percentage:.1f}% risk needs aggressive management. Get lipid panel, likely need statin. Diet changes: limit saturated fat <7% calories, increase soluble fiber (10-25g/day), add plant sterols (2g/day). Recheck in 6 weeks.'
+            'category': 'Alcohol Management',
+            'title': 'Reduce Alcohol Consumption',
+            'description': f'Alcohol intake increases your {risk_percentage:.1f}% risk. Limit to ≤1 drink/day for women, ≤2 for men. Consider abstaining if risk is high. Excessive alcohol raises blood pressure and triglycerides.'
         })
     
-    # GLUCOSE/DIABETES
-    if patient_data.get('gluc', 1) == 3:
-        risk_factors.append('very high blood sugar')
+    # Glucose/diabetes recommendations
+    if patient_data.get('gluc', 1) >= 2:
+        risk_factors.append('high glucose')
         priority = 'critical' if risk_percentage >= 66 else 'high'
         recommendations.append({
             'priority': priority,
-            'category': 'Diabetes Management',
-            'title': 'Urgent Diabetes Evaluation',
-            'description': f'Very high glucose + {risk_percentage:.1f}% CVD risk is critical. Get HbA1c and fasting glucose tests immediately. Likely need diabetes medication (Metformin, etc.). See endocrinologist. Strict carb control (<130g/day), monitor blood sugar 3x/day, exercise after meals.'
-        })
-    elif patient_data.get('gluc', 1) == 2:
-        risk_factors.append('elevated blood sugar')
-        priority = 'high' if risk_percentage >= 50 else 'medium'
-        recommendations.append({
-            'priority': priority,
-            'category': 'Blood Sugar',
-            'title': 'Prediabetes Management',
-            'description': f'Elevated glucose at {risk_percentage:.1f}% risk requires intervention. Get HbA1c test. Reduce refined carbs, sugar intake. Follow low-glycemic diet. Exercise 30 min after meals. Lose 7% body weight to reduce diabetes risk by 58%. Monitor fasting glucose monthly.'
+            'category': 'Blood Sugar Management',
+            'title': 'Glucose Control Required',
+            'description': f'Elevated glucose with {risk_percentage:.1f}% CVD risk requires immediate action. Get HbA1c test. If diabetic, strict glucose control essential. Reduce refined carbs, increase fiber, monitor blood sugar. Diabetes doubles CVD risk.'
         })
     
-    # AGE-SPECIFIC with percentage awareness
-    age = patient_data.get('age', 50)
-    if age >= 65 and risk_percentage >= 50:
-        recommendations.append({
-            'priority': 'high',
-            'category': 'Age-Related Monitoring',
-            'title': 'Enhanced Monitoring for Age 65+',
-            'description': f'Age {age} with {risk_percentage:.1f}% risk requires vigilant monitoring. Quarterly medical check-ups, monthly BP checks, annual cardiac stress test, echocardiogram every 2 years. Discuss aspirin therapy and aggressive risk factor management with doctor.'
-        })
-    elif age >= 60:
-        priority = 'medium' if risk_percentage < 50 else 'high'
-        recommendations.append({
-            'priority': priority,
-            'category': 'Preventive Care',
-            'title': 'Increased Screening for Age 60+',
-            'description': f'At age {age}, biannual cardiovascular check-ups recommended. Annual ECG, lipid panel, diabetes screening. Discuss preventive medications (statins, aspirin) with your doctor even if risk is currently {risk_percentage:.1f}%.'
-        })
-    
-    # COMPREHENSIVE LIFESTYLE RECOMMENDATIONS based on risk tier
-    if risk_percentage >= 66:
-        recommendations.append({
-            'priority': 'high',
-            'category': 'Comprehensive Lifestyle',
-            'title': '🎯 Intensive Risk Reduction Program',
-            'description': 'HIGH RISK tier requires: 1) Immediate doctor visit, 2) Daily BP monitoring, 3) 40min exercise 6 days/week, 4) Strict heart-healthy diet (Mediterranean/DASH), 5) Stress management (meditation 15min/day), 6) Sleep 7-8 hours, 7) Weekly weight tracking, 8) Medication compliance.'
-        })
-    elif risk_percentage >= 33:
-        recommendations.append({
-            'priority': 'medium',
-            'category': 'Lifestyle Optimization',
-            'title': '📊 Moderate Risk Prevention Plan',
-            'description': 'MEDIUM RISK tier: 1) Doctor check-up within month, 2) Weekly BP checks, 3) 150min moderate exercise/week, 4) Heart-healthy diet (more vegetables, less processed foods), 5) Weight management, 6) Stress reduction, 7) Limit alcohol, 8) Quality sleep 7-9 hours.'
-        })
-    else:
-        recommendations.append({
-            'priority': 'low',
-            'category': 'Health Maintenance',
-            'title': '✅ Maintain Excellent Heart Health',
-            'description': 'LOW RISK tier: 1) Annual wellness check-up, 2) Continue regular exercise, 3) Maintain healthy diet, 4) Manage stress, 5) Healthy weight, 6) Moderate alcohol, 7) No smoking, 8) Good sleep habits. You\'re doing great - keep it up!'
-        })
-    
-    return {
-        'items': recommendations[:8],  # Top 8 most relevant recommendations
-        'risk_factors_identified': risk_factors,
-        'risk_percentage': risk_percentage,
-        'risk_category': risk_category,
-        'total_recommendations': len(recommendations)
-    }
-
-
-@app.route('/', methods=['GET'])
-def home():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'success',
-        'message': 'Backend API is running',
-        'timestamp': datetime.now().isoformat(),
-        'version': '1.0.0'
+    # General recommendations
+    recommendations.append({
+        'priority': 'medium',
+        'category': 'Diet',
+        'title': '🥗 Heart-Healthy Diet',
+        'description': 'Follow Mediterranean or DASH diet: more vegetables, fruits, whole grains, fish, nuts, olive oil. Less red meat, processed foods, added sugars, saturated fat. Aim for 5+ servings of fruits/vegetables daily.'
     })
+    
+    recommendations.append({
+        'priority': 'medium',
+        'category': 'Monitoring',
+        'title': '📊 Regular Health Monitoring',
+        'description': f'With {risk_percentage:.1f}% risk, monitor key metrics: BP monthly, weight weekly, cholesterol annually, glucose annually. Keep health log. Schedule regular check-ups with your doctor.'
+    })
+    
+    # Sort by priority
+    priority_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
+    recommendations.sort(key=lambda x: priority_order.get(x['priority'], 3))
+    
+    return recommendations
 
+# ============================================================================
+# FLASK APPLICATION
+# ============================================================================
+
+app = Flask(__name__)
+CORS(app)
+
+# Initialize model manager
+model_manager = ModelManager()
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Detailed health check"""
+    """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
         'model_loaded': model_manager.is_model_loaded(),
-        'models_loaded': model_manager.is_model_loaded(),
-        'available_models': model_manager.get_available_models()
+        'timestamp': datetime.now().isoformat()
     })
-
 
 @app.route('/api/predict', methods=['POST'])
 def predict():
-    """Make predictions using the loaded model"""
+    """Make CVD risk prediction"""
     try:
-        # Get JSON data
         data = request.get_json()
         
         if not data:
-            return jsonify({
-                'success': False,
-                'error': 'No data provided'
-            }), 400
+            return jsonify({'success': False, 'error': 'No data provided'}), 400
         
-        logger.info(f"Received prediction request: {data}")
+        if not model_manager.is_model_loaded():
+            return jsonify({'success': False, 'error': 'Model not loaded. Please train a model first.'}), 503
         
-        # Transform frontend data to match model expectations
-        # Frontend can send either numeric (1, 2, 3) or text ("Male", "Normal") formats
+        logger.info(f"Prediction request: {data}")
         
-        # Handle gender - can be numeric (1, 2) or text ("Male", "Female")
-        gender = data.get('gender', 1)
-        if isinstance(gender, str):
-            gender_map = {'Male': 2, 'Female': 1, 'male': 2, 'female': 1}
-            gender = gender_map.get(gender, 1)
-        else:
-            gender = int(gender)
-        
-        # Handle cholesterol - can be numeric (1, 2, 3) or text
-        cholesterol = data.get('cholesterol', 1)
-        if isinstance(cholesterol, str):
-            level_map = {
-                'Normal': 1,
-                'Above Normal': 2,
-                'Well Above Normal': 3,
-                'normal': 1,
-                'above normal': 2,
-                'well above normal': 3
-            }
-            cholesterol = level_map.get(cholesterol, 1)
-        else:
-            cholesterol = int(cholesterol)
-        
-        # Handle glucose - can be numeric (1, 2, 3) or text
-        glucose = data.get('gluc', data.get('glucose', 1))
-        if isinstance(glucose, str):
-            level_map = {
-                'Normal': 1,
-                'Above Normal': 2,
-                'Well Above Normal': 3,
-                'normal': 1,
-                'above normal': 2,
-                'well above normal': 3
-            }
-            glucose = level_map.get(glucose, 1)
-        else:
-            glucose = int(glucose)
-        
-        # Extract and transform data
-        transformed_data = {
-            'age': float(data.get('age', 50)) * 365.25,  # Convert years to days for model
-            'gender': gender,
-            'height': float(data.get('height', 170)),
-            'weight': float(data.get('weight', 70)),
-            'ap_hi': float(data.get('ap_hi', 120)),
-            'ap_lo': float(data.get('ap_lo', 80)),
-            'cholesterol': cholesterol,
-            'gluc': glucose,
-            'smoke': int(data.get('smoke', 0)),
-            'alco': int(data.get('alco', 0)),
-            'active': int(data.get('active', 1))
-        }
+        # Transform age from years to days for processing
+        transformed_data = data.copy()
+        if 'age' in transformed_data and transformed_data['age'] < 200:
+            transformed_data['age'] = transformed_data['age'] * 365.25
         
         logger.info(f"Transformed data: {transformed_data}")
-        
-        # Validate input
-        is_valid, error_message = validate_prediction_input(transformed_data)
-        if not is_valid:
-            logger.error(f"Validation failed: {error_message}")
-            return jsonify({
-                'success': False,
-                'error': error_message
-            }), 400
         
         # Make prediction
         prediction = model_manager.predict(transformed_data)
         
-        logger.info(f"Prediction made successfully: {prediction}")
+        logger.info(f"Prediction: {prediction}")
         
-        # Get model name
-        model_info = model_manager.get_model_info()
-        model_name = model_info.get('type', 'logistic_regression')
-        
-        # Generate personalized recommendations based on risk and patient data
+        # Generate recommendations
         recommendations = generate_recommendations(
             prediction.get('risk_level', 'Unknown'),
             prediction.get('probability', 0),
             data
         )
+        
+        model_info = model_manager.get_model_info()
         
         return jsonify({
             'success': True,
@@ -439,108 +584,76 @@ def predict():
             'risk_probability': prediction.get('probability', 0),
             'probability': prediction.get('probability', 0),
             'confidence': prediction.get('confidence', 0),
-            'model_used': model_name,
-            'input': data,  # Return the original input data
+            'model_used': model_info.get('type', 'unknown'),
+            'input': data,
             'recommendations': recommendations,
             'timestamp': datetime.now().isoformat()
         })
         
     except Exception as e:
         logger.error(f"Prediction error: {str(e)}", exc_info=True)
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        return jsonify({'success': False, 'error': str(e)}), 500
 
-
-@app.route('/api/models', methods=['GET'])
-def get_models():
-    """Get list of available models"""
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    """Get dataset statistics"""
     try:
-        models = model_manager.get_available_models()
-        return jsonify({
+        data_path = os.path.join('data', 'cardio_train.csv')
+        
+        if not os.path.exists(data_path):
+            return jsonify({'success': False, 'error': 'Dataset not found'}), 404
+        
+        # Load data
+        df = pd.read_csv(data_path, delimiter=';')
+        
+        # Calculate statistics
+        total_records = int(len(df))
+        positive_cases = int(df[df['cardio'] == 1].shape[0])
+        negative_cases = int(df[df['cardio'] == 0].shape[0])
+        prevalence_value = float(positive_cases) / float(total_records) if total_records > 0 else 0.0
+        
+        # Age distribution
+        df['age_years'] = df['age'] / 365.25
+        age_bins = [0, 40, 50, 60, 70, 120]
+        age_labels = ['30-40', '40-50', '50-60', '60-70', '70+']
+        df['age_group'] = pd.cut(df['age_years'], bins=age_bins, labels=age_labels, right=False)
+        age_dist = df['age_group'].value_counts().sort_index()
+        age_distribution = {str(k): int(v) for k, v in age_dist.items()}
+        
+        # Statistics
+        avg_age = float(df['age'].mean() / 365.25)
+        female_count = int(df[df['gender'] == 1].shape[0])
+        male_count = int(df[df['gender'] == 2].shape[0])
+        avg_systolic = float(df['ap_hi'].mean())
+        avg_diastolic = float(df['ap_lo'].mean())
+        bmi_series = df['weight'] / ((df['height'] / 100) ** 2)
+        avg_bmi = float(bmi_series.mean())
+        
+        stats = {
             'success': True,
-            'models': models,
-            'current_model': model_manager.get_current_model()
-        })
-    except Exception as e:
-        logger.error(f"Error getting models: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-@app.route('/api/model/info', methods=['GET'])
-def get_model_info():
-    """Get information about the current model"""
-    try:
-        info = model_manager.get_model_info()
-        return jsonify({
-            'success': True,
-            'model_info': info
-        })
-    except Exception as e:
-        logger.error(f"Error getting model info: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-@app.route('/api/data/info', methods=['GET'])
-def get_data_info():
-    """Get information about the dataset"""
-    try:
-        info = {
-            'dataset': 'Cardiovascular Disease',
-            'total_records': 70000,
-            'features': {
-                'age': 'Age in days (converted to years)',
-                'gender': 'Gender (1: Female, 2: Male)',
-                'height': 'Height in cm',
-                'weight': 'Weight in kg',
-                'ap_hi': 'Systolic blood pressure',
-                'ap_lo': 'Diastolic blood pressure',
-                'cholesterol': 'Cholesterol level (1: Normal, 2: Above normal, 3: Well above normal)',
-                'gluc': 'Glucose level (1: Normal, 2: Above normal, 3: Well above normal)',
-                'smoke': 'Smoking (0: No, 1: Yes)',
-                'alco': 'Alcohol intake (0: No, 1: Yes)',
-                'active': 'Physical activity (0: No, 1: Yes)'
+            'total_samples': total_records,
+            'total_records': total_records,
+            'positive_cases': positive_cases,
+            'negative_cases': negative_cases,
+            'prevalence': round(prevalence_value, 4),
+            'average_age': round(avg_age, 2),
+            'age_distribution': age_distribution,
+            'gender_distribution': {
+                'female': female_count,
+                'male': male_count
             },
-            'engineered_features': {
-                'age_years': 'Age in years',
-                'bmi': 'Body Mass Index',
-                'pulse_pressure': 'Pulse pressure (ap_hi - ap_lo)'
-            },
-            'target': {
-                'cardio': 'Cardiovascular disease (0: No, 1: Yes)'
-            },
-            'example': {
-                'age': 18393,
-                'gender': 2,
-                'height': 168,
-                'weight': 62.0,
-                'ap_hi': 110,
-                'ap_lo': 80,
-                'cholesterol': 1,
-                'gluc': 1,
-                'smoke': 0,
-                'alco': 0,
-                'active': 1
-            }
+            'average_systolic_bp': round(avg_systolic, 2),
+            'average_diastolic_bp': round(avg_diastolic, 2),
+            'avg_bmi': round(avg_bmi, 2)
         }
-        return jsonify({
-            'success': True,
-            'data_info': info
-        })
+        
+        logger.info(f"Stats: Total={total_records}, CVD={positive_cases}, Prev={prevalence_value:.2%}, AvgAge={avg_age:.1f}")
+        
+        return jsonify(stats)
+        
     except Exception as e:
-        logger.error(f"Error getting data info: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
+        logger.error(f"Stats error: {str(e)}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/train', methods=['POST'])
 def train():
@@ -549,15 +662,11 @@ def train():
         data = request.get_json()
         model_type = data.get('model_type', 'logistic_regression') if data else 'logistic_regression'
         
-        logger.info(f"Starting training for model type: {model_type}")
+        logger.info(f"Training request: {model_type}")
         
-        # Train model
-        result = train_model(model_type)
+        result = model_manager.train_model(model_type)
         
         if result['success']:
-            # Reload model manager
-            model_manager.load_model(result['model_path'])
-            
             return jsonify({
                 'success': True,
                 'message': 'Model trained successfully',
@@ -572,203 +681,67 @@ def train():
             
     except Exception as e:
         logger.error(f"Training error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        return jsonify({'success': False, 'error': str(e)}), 500
 
-
-@app.route('/api/evaluate', methods=['POST'])
-def evaluate():
-    """Evaluate model performance"""
+@app.route('/api/models', methods=['GET'])
+def get_models():
+    """Get available models"""
     try:
-        data = request.get_json()
+        trained_dir = os.path.join('models', 'trained')
+        models = []
         
-        metrics = model_manager.evaluate(data)
+        if os.path.exists(trained_dir):
+            pkl_files = [f for f in os.listdir(trained_dir) if f.endswith('.pkl')]
+            models = sorted(pkl_files, key=lambda f: os.path.getmtime(os.path.join(trained_dir, f)), reverse=True)
         
         return jsonify({
             'success': True,
-            'metrics': metrics
+            'models': models,
+            'current_model': os.path.basename(model_manager.model_path) if model_manager.model_path else None
         })
-        
     except Exception as e:
-        logger.error(f"Evaluation error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-@app.route('/api/stats', methods=['GET'])
-def get_stats():
-    """Get dataset statistics for analytics page"""
-    try:
-        # Check if data file exists
-        data_path = os.path.join(os.path.dirname(__file__), 'data', 'cardio_train.csv')
-        
-        if not os.path.exists(data_path):
-            return jsonify({
-                'success': False,
-                'error': 'Dataset not found'
-            }), 404
-        
-        # Load and analyze data
-        import pandas as pd
-        import numpy as np
-        df = pd.read_csv(data_path, delimiter=';')
-        
-        # Calculate counts
-        total_records = int(len(df))
-        positive_cases = int(df[df['cardio'] == 1].shape[0])
-        negative_cases = int(df[df['cardio'] == 0].shape[0])
-        prevalence_value = float(positive_cases) / float(total_records) if total_records > 0 else 0.0
-        
-        # Calculate age distribution
-        df['age_years'] = df['age'] / 365.25
-        age_bins = [0, 40, 50, 60, 70, 120]
-        age_labels = ['30-40', '40-50', '50-60', '60-70', '70+']
-        df['age_group'] = pd.cut(df['age_years'], bins=age_bins, labels=age_labels, right=False)
-        age_dist = df['age_group'].value_counts().sort_index()
-        age_distribution = {str(k): int(v) for k, v in age_dist.items()}
-        
-        # Age statistics (convert from days to years)
-        avg_age = float(df['age'].mean() / 365.25)
-        
-        # Gender distribution (1=Female, 2=Male)
-        female_count = int(df[df['gender'] == 1].shape[0])
-        male_count = int(df[df['gender'] == 2].shape[0])
-        
-        # Blood pressure statistics
-        avg_systolic = float(df['ap_hi'].mean())
-        avg_diastolic = float(df['ap_lo'].mean())
-        
-        # BMI statistics
-        bmi_series = df['weight'] / ((df['height'] / 100) ** 2)
-        avg_bmi = float(bmi_series.mean())
-        
-        # Lifestyle factors
-        smokers_count = int(df[df['smoke'] == 1].shape[0])
-        alcohol_count = int(df[df['alco'] == 1].shape[0])
-        active_count = int(df[df['active'] == 1].shape[0])
-        
-        # Cholesterol distribution
-        chol_normal = int(df[df['cholesterol'] == 1].shape[0])
-        chol_above = int(df[df['cholesterol'] == 2].shape[0])
-        chol_high = int(df[df['cholesterol'] == 3].shape[0])
-        
-        # Glucose distribution
-        gluc_normal = int(df[df['gluc'] == 1].shape[0])
-        gluc_above = int(df[df['gluc'] == 2].shape[0])
-        gluc_high = int(df[df['gluc'] == 3].shape[0])
-        
-        # Build response with explicit typing
-        stats = {
-            'success': True,
-            'total_samples': total_records,
-            'total_records': total_records,
-            'positive_cases': positive_cases,
-            'negative_cases': negative_cases,
-            'prevalence': round(prevalence_value, 4),
-            'features_count': len(df.columns) - 1,
-            
-            # Age statistics
-            'average_age': round(avg_age, 2),
-            'age_mean': round(avg_age, 2),
-            'age_min': round(float(df['age'].min() / 365.25), 2),
-            'age_max': round(float(df['age'].max() / 365.25), 2),
-            'age_distribution': age_distribution,
-            
-            # Gender distribution
-            'gender_distribution': {
-                'female': female_count,
-                'male': male_count
-            },
-            
-            # Blood pressure statistics
-            'avg_systolic_bp': round(avg_systolic, 2),
-            'avg_diastolic_bp': round(avg_diastolic, 2),
-            'average_systolic_bp': round(avg_systolic, 2),
-            'average_diastolic_bp': round(avg_diastolic, 2),
-            'ap_hi_mean': round(avg_systolic, 2),
-            'ap_lo_mean': round(avg_diastolic, 2),
-            
-            # BMI statistics
-            'avg_bmi': round(avg_bmi, 2),
-            'bmi_mean': round(avg_bmi, 2),
-            
-            # Lifestyle factors
-            'smokers': smokers_count,
-            'alcohol': alcohol_count,
-            'active': active_count,
-            
-            # Cholesterol distribution
-            'cholesterol_distribution': {
-                'normal': chol_normal,
-                'above_normal': chol_above,
-                'well_above_normal': chol_high
-            },
-            
-            # Glucose distribution
-            'glucose_distribution': {
-                'normal': gluc_normal,
-                'above_normal': gluc_above,
-                'well_above_normal': gluc_high
-            }
-        }
-        
-        logger.info(f"Statistics calculated: Total={total_records}, CVD={positive_cases}, Prev={prevalence_value:.2%}, AvgAge={avg_age:.1f}")
-        
-        return jsonify(stats)
-        
-    except Exception as e:
-        logger.error(f"Error getting statistics: {str(e)}", exc_info=True)
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
+        logger.error(f"Error getting models: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.errorhandler(404)
 def not_found(e):
-    """Handle 404 errors"""
-    return jsonify({
-        'success': False,
-        'error': 'Endpoint not found'
-    }), 404
-
+    return jsonify({'success': False, 'error': 'Endpoint not found'}), 404
 
 @app.errorhandler(500)
 def internal_error(e):
-    """Handle 500 errors"""
     logger.error(f"Internal server error: {str(e)}")
-    return jsonify({
-        'success': False,
-        'error': 'Internal server error'
-    }), 500
+    return jsonify({'success': False, 'error': 'Internal server error'}), 500
 
+# ============================================================================
+# MAIN
+# ============================================================================
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     debug = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     
-    print("\n" + "="*70)
-    print("CARDIOVASCULAR DISEASE PREDICTION API")
-    print("="*70)
+    print("\n" + "="*80)
+    print("CARDIOVASCULAR DISEASE PREDICTION API - STANDALONE VERSION")
+    print("="*80)
     print(f"Server: http://localhost:{port}")
-    print(f"API Endpoint: http://localhost:{port}/api/predict")
-    print(f"Health Check: http://localhost:{port}/api/health")
-    print("="*70)
+    print(f"Health: http://localhost:{port}/api/health")
+    print(f"Predict: http://localhost:{port}/api/predict")
+    print(f"Stats: http://localhost:{port}/api/stats")
+    print("="*80)
     
     if model_manager.is_model_loaded():
         print("MODEL STATUS: READY")
+        print(f"Model Type: {model_manager.get_model_info()['type']}")
+        print(f"Features: {model_manager.get_model_info()['features']} features")
         print("FRONTEND CAN NOW CONNECT AND MAKE PREDICTIONS")
     else:
         print("MODEL STATUS: NOT LOADED")
-        print("Run: python scripts/train.py")
+        print("Train a model by calling: POST /api/train")
+        print("Or ensure a trained model exists in models/trained/")
     
-    print("="*70)
+    print("="*80)
     print("Server is starting...")
-    print("="*70 + "\n")
+    print("="*80 + "\n")
     
     logger.info(f"Starting Flask server on port {port}")
     app.run(host='0.0.0.0', port=port, debug=debug)
